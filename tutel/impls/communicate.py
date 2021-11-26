@@ -7,7 +7,7 @@ import os
 import re
 import time
 import torch
-import logging 
+import logging
 from torch import Tensor
 import torch.distributed as dist
 
@@ -33,13 +33,15 @@ class AllToAll(torch.autograd.Function):
             AllToAll.__prepared__ = True
             if not hasattr(dist, 'all_to_all_single') and (AllToAll.a2a_type & 1) == 1:
                 AllToAll.a2a_type ^= 3
-            if (AllToAll.a2a_type & 2) == 2 and get_world_size(group) > 1:
+            if get_world_rank(group) == 0:
+                logging.info('AllToAll Type: %d.' % (AllToAll.a2a_type))
+            if (((AllToAll.a2a_type & 2) == 2) or ((AllToAll.a2a_type & 4) == 4)) and (get_world_size(group) > 1):
                 host_unique_id = torch.zeros([256], dtype=torch.int32).cpu()
                 if get_world_rank(group) == 0:
-                    tutel_custom_kernel.external_all2all(host_unique_id, 0)
+                    tutel_custom_kernel.external_all2all(host_unique_id, 0, False)
                 host_unique_id = host_unique_id.to(input.device)
                 dist.broadcast(host_unique_id, 0, group, async_op=True).wait()
-                tutel_custom_kernel.external_all2all(host_unique_id.cpu(), 1)
+                tutel_custom_kernel.external_all2all(host_unique_id.cpu(), 1, False)
 
         ctx.group = group
         ctx.world_size = get_world_size(group)
@@ -52,8 +54,10 @@ class AllToAll(torch.autograd.Function):
         if (AllToAll.a2a_type & 1) == 1:
           output = torch.empty_like(input)
           dist.all_to_all_single(output, input, group=group)
+        elif (AllToAll.a2a_type & 4) == 4:
+          output = tutel_custom_kernel.external_all2all(input, -1, True)
         else:
-          output = tutel_custom_kernel.external_all2all(input, -1)
+          output = tutel_custom_kernel.external_all2all(input, -1, False)
         if (AllToAll.a2a_type & 8) == 8:
             torch.cuda.synchronize(input.device)
             t_stop = time.time()
@@ -112,5 +116,5 @@ class PostAllreduceSum(torch.autograd.Function):
         return (None, dinput)
 
 
-# A2A_TYPE: 0 for skip AllToAll, 1 for standard Pytorch AllToAll, 9 for standard Pytorch AllToAll with Timing
+# A2A_TYPE: 0 for skip AllToAll, 1 for standard Pytorch AllToAll, 4 for compressed AllToAll, 9 for standard Pytorch AllToAll with Timing
 AllToAll.a2a_type = int(os.environ.get('A2A_TYPE', '1'))

@@ -62,6 +62,7 @@ setup(
     ext_modules=[
         CUDAExtension('tutel_custom_kernel', [
             './tutel/custom/custom_kernel.cpp',
+            './tutel/custom/bagua_kernels.cu',
         ],
         library_dirs=['/usr/local/cuda/lib64/stubs'],
         libraries=['dl', 'cuda', 'nvrtc', 'nccl'] if not IS_HIP_EXTENSION else [],
