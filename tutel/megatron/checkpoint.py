@@ -6,6 +6,7 @@ import os
 import sys
 import random
 from collections import OrderedDict
+import bagua.torch_api as bagua
 import numpy as np
 import torch
 
@@ -55,8 +56,6 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     from megatron import mpu
     from megatron import print_rank_last
 
-    expert_dp_comm = "none"
-
     if mpu.get_data_parallel_rank() == 0:
         # at dp rank 0, we still follows the native load_checkpoint by megatron
         from megatron.checkpointing import save_checkpoint as save_checkpoint_native
@@ -80,19 +79,19 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         keep_vars=(mpu.get_data_parallel_rank() > 0)
     )
 
-    def extract_expert_param(state_dict, expert_dp_comm="none"):
+    def extract_expert_param(state_dict):
         state_dict_new = state_dict.__class__()
         for k, v in state_dict.items():
             # megatron uses both dict and OrderedDict in its state_dict
             if isinstance(v, (OrderedDict, dict)):
-                v_new = extract_expert_param(v, expert_dp_comm)
+                v_new = extract_expert_param(v)
                 if len(v_new) > 0:
                     state_dict_new[k] = v_new
-            elif hasattr(v, "dp_comm") and v.dp_comm == expert_dp_comm:
+            elif bagua.moe.is_moe_param(v):
                 state_dict_new[k] = v.detach()
         return state_dict_new
 
-    state_dict["model"] = extract_expert_param(state_dict["model"], expert_dp_comm)
+    state_dict["model"] = extract_expert_param(state_dict["model"])
 
     # Optimizer stuff.
     if not args.no_save_optim:
@@ -101,9 +100,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
             param_global_idx = 0
             for param_group in optimizer.optimizer.param_groups:
                 for param in param_group["params"]:
-                    if not (
-                        hasattr(param, "dp_comm") and param.dp_comm == expert_dp_comm
-                    ):
+                    if not bagua.moe.is_moe_param(param):
                         # this parameter is not an expert parameter
                         # thus there is no need to save its state in current rank
                         # since it has been saved by data parallel rank 0
@@ -128,12 +125,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
                 for param_group in fp32_from_fp16_params:
                     param_group_copy = []
                     for param in param_group:
-                        param_copy = (
-                            param
-                            if hasattr(param, "dp_comm")
-                            and param.dp_comm == expert_dp_comm
-                            else None
-                        )
+                        param_copy = param if bagua.moe.is_moe_param(param) else None
                         param_group_copy.append(param_copy)
                     state_dict["optimizer"]["fp32_from_fp16_params"].append(
                         param_group_copy
