@@ -23,6 +23,45 @@
 #define CHECK_CUDA(x) AT_ASSERTM(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) AT_ASSERTM(x.is_contiguous(), #x " must be contiguous")
 
+extern "C" size_t array_min_max_size_f16_host(
+  at::Half *input,
+  int input_num_element,
+  at::Half *output,
+  cudaStream_t stream);
+
+extern "C" void compress_f16_to_uint8_host(
+    at::Half *input, 
+    int input_num_element,
+    int chunk_size,
+    int num_chunks,
+    uint8_t *output,
+    size_t output_size,
+    void *dev_buffer,
+    size_t dev_size,
+    int target_chunk,
+    cudaStream_t stream);
+
+extern "C" void decompress_uint8_to_f16_host(
+    uint8_t *input,
+    size_t input_size,
+    int chunk_size,
+    int num_chunks,
+    at::Half *output,
+    cudaStream_t stream);
+
+
+inline size_t align_size(size_t size, size_t align) {
+  return ((size) + (align) - 1) / (align) * (align);
+}
+
+size_t get_compressed_buffer_size(int n_chunks, int chunk_size) {
+  size_t align_bytes = 32;
+  size_t compressed_align_bytes = align_size(chunk_size, align_bytes) * n_chunks;
+  size_t min_max_align_bytes = align_size(2 * 2, align_bytes) * n_chunks;
+  return compressed_align_bytes + min_max_align_bytes;
+}
+
+
 static std::string file_read(const char *path) {
   FILE *fp = fopen(path, "rb");
   CHECK_EQ(true, fp != nullptr);
@@ -186,7 +225,7 @@ static void invoke_with_source(const std::vector<torch::Tensor> &ts, int code_id
 }
 
 
-static torch::Tensor external_all2all(const torch::Tensor &tensor, int stage) {
+static torch::Tensor external_all2all(const torch::Tensor &tensor, int stage, bool use_compress=false) {
   // Designed for older Pytorch without dist.alltoall() support
   static ncclComm_t comm;
   static int world_size, world_rank, local_rank;
@@ -218,6 +257,54 @@ static torch::Tensor external_all2all(const torch::Tensor &tensor, int stage) {
   CHECK_EQ(0, length % world_size);
 
   auto output = torch::empty_like(tensor, torch::MemoryFormat::Contiguous);
+
+  if (use_compress) {
+    size_t chunk_size = tensor.numel() / world_size;
+
+    size_t compressed_buff_size = get_compressed_buffer_size(world_size, chunk_size);
+    auto compressed_buff = tensor.new_empty({compressed_buff_size}, at::ScalarType::Byte);
+
+    auto compressed_output_buff = torch::empty_like(compressed_buff, torch::MemoryFormat::Contiguous);
+
+    size_t temp_buff_size = array_min_max_size_f16_host(
+        tensor.data_ptr<at::Half>(),
+        chunk_size,
+        reinterpret_cast<at::Half*>(compressed_buff.data_ptr<uint8_t>()),
+        nullptr);
+    auto temp_buff = tensor.new_empty({temp_buff_size}, at::ScalarType::Byte);
+
+    compress_f16_to_uint8_host(
+      tensor.data_ptr<at::Half>(),
+      tensor.numel(),
+      chunk_size,
+      world_size,
+      compressed_buff.data_ptr<uint8_t>(),
+      compressed_buff_size,
+      temp_buff.data_ptr<uint8_t>(),
+      temp_buff_size,
+      -1,
+      nullptr);
+
+    auto compressed_buff_ptr = (char*)compressed_buff.data_ptr();
+    size_t compressed_slice_size = compressed_buff.nbytes() / world_size;
+
+    CHECK_EQ(0, ncclGroupStart());
+    for (int r = 0; r < world_size; r++) {
+      CHECK_EQ(0, ncclSend(compressed_buff_ptr + r * compressed_slice_size, compressed_slice_size, ncclInt8, r, comm, nullptr));
+      CHECK_EQ(0, ncclRecv(((char*)compressed_output_buff.data_ptr()) + r * compressed_slice_size, compressed_slice_size, ncclInt8, r, comm, nullptr));
+    }
+    CHECK_EQ(0, ncclGroupEnd());
+
+    decompress_uint8_to_f16_host(
+      compressed_output_buff.data_ptr<uint8_t>(),
+      compressed_output_buff.numel(),
+      chunk_size,
+      world_size,
+      output.data_ptr<at::Half>(),
+      nullptr);
+    return output;
+  }
+
 
   CHECK_EQ(0, ncclGroupStart());
   for (int r = 0; r < world_size; r++) {
